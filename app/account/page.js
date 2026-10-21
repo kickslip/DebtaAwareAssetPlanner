@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import {
   ArrowLeft,
@@ -33,8 +33,26 @@ async function api(path, options = {}) {
   });
   if (response.status === 204) return null;
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.error || "Request failed.");
+  if (!response.ok) {
+    const error = new Error(payload.error || "Request failed.");
+    error.status = response.status;
+    throw error;
+  }
   return payload;
+}
+
+function acquireIdempotencyKey(reference, operation, userId) {
+  if (reference.current?.userId === userId) return reference.current.key;
+  const storageKey = `debtaware:${userId}:${operation}`;
+  const key = sessionStorage.getItem(storageKey) || crypto.randomUUID();
+  sessionStorage.setItem(storageKey, key);
+  reference.current = { userId, key };
+  return key;
+}
+
+function releaseIdempotencyKey(reference, operation, userId) {
+  sessionStorage.removeItem(`debtaware:${userId}:${operation}`);
+  reference.current = null;
 }
 
 function MoneyInput({ label, value, onChange }) {
@@ -69,6 +87,7 @@ export default function AccountPage() {
     goalUpdatesEnabled: false,
   });
   const [integrations, setIntegrations] = useState(null);
+  const [consents, setConsents] = useState([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
@@ -107,17 +126,22 @@ export default function AccountPage() {
     reason: "",
   });
   const [negotiationDraft, setNegotiationDraft] = useState("");
+  const debtIdempotencyKey = useRef(null);
+  const paymentIdempotencyKey = useRef(null);
+  const goalIdempotencyKey = useRef(null);
 
   const refresh = useCallback(async () => {
-    const [data, currentPreferences, providerStatus] = await Promise.all([
+    const [data, currentPreferences, providerStatus, consentRecords] = await Promise.all([
       api("/api/overview"),
       api("/api/notification-preferences"),
       api("/api/integrations"),
+      api("/api/consents"),
     ]);
     setOverview(data);
     setProfile(data.profile);
     setPreferences(currentPreferences);
     setIntegrations(providerStatus);
+    setConsents(consentRecords);
     setPaymentForm((current) => ({
       ...current,
       debtAccountId: current.debtAccountId || data.debts[0]?.id || "",
@@ -193,17 +217,36 @@ export default function AccountPage() {
 
   const addDebt = (event) => {
     event.preventDefault();
+    const key = acquireIdempotencyKey(
+      debtIdempotencyKey,
+      "debt",
+      user.id,
+    );
     perform(
       async () => {
-        await api("/api/debts", {
-          method: "POST",
-          body: JSON.stringify({
-            ...debtForm,
-            balance: Number(debtForm.balance),
-            monthlyPayment: Number(debtForm.monthlyPayment),
-            annualRate: Number(debtForm.annualRate) || 0,
-          }),
-        });
+        try {
+          await api("/api/debts", {
+            method: "POST",
+            headers: { "Idempotency-Key": key },
+            body: JSON.stringify({
+              ...debtForm,
+              balance: Number(debtForm.balance),
+              monthlyPayment: Number(debtForm.monthlyPayment),
+              annualRate: Number(debtForm.annualRate) || 0,
+            }),
+          });
+        } catch (requestError) {
+          if (
+            requestError.status === 409 &&
+            requestError.message.includes("idempotency key")
+          ) {
+            await refresh();
+            releaseIdempotencyKey(debtIdempotencyKey, "debt", user.id);
+          }
+          throw requestError;
+        }
+        await refresh();
+        releaseIdempotencyKey(debtIdempotencyKey, "debt", user.id);
         setDebtForm({
           name: "",
           debtType: "credit_card",
@@ -211,7 +254,6 @@ export default function AccountPage() {
           monthlyPayment: "",
           annualRate: "",
         });
-        await refresh();
       },
       "Debt account added.",
     );
@@ -219,18 +261,36 @@ export default function AccountPage() {
 
   const addPayment = (event) => {
     event.preventDefault();
+    const key = acquireIdempotencyKey(
+      paymentIdempotencyKey,
+      "payment",
+      user.id,
+    );
     perform(
       async () => {
-        await api("/api/payments", {
-          method: "POST",
-          body: JSON.stringify({
-            debtAccountId: paymentForm.debtAccountId || null,
-            amount: Number(paymentForm.amount),
-            note: paymentForm.note,
-          }),
-        });
-        setPaymentForm((current) => ({ ...current, amount: "", note: "" }));
+        try {
+          await api("/api/payments", {
+            method: "POST",
+            headers: { "Idempotency-Key": key },
+            body: JSON.stringify({
+              debtAccountId: paymentForm.debtAccountId || null,
+              amount: Number(paymentForm.amount),
+              note: paymentForm.note,
+            }),
+          });
+        } catch (requestError) {
+          if (
+            requestError.status === 409 &&
+            requestError.message.includes("idempotency key")
+          ) {
+            await refresh();
+            releaseIdempotencyKey(paymentIdempotencyKey, "payment", user.id);
+          }
+          throw requestError;
+        }
         await refresh();
+        releaseIdempotencyKey(paymentIdempotencyKey, "payment", user.id);
+        setPaymentForm((current) => ({ ...current, amount: "", note: "" }));
       },
       "Payment recorded and debt overview updated.",
     );
@@ -238,17 +298,36 @@ export default function AccountPage() {
 
   const addGoal = (event) => {
     event.preventDefault();
+    const key = acquireIdempotencyKey(
+      goalIdempotencyKey,
+      "goal",
+      user.id,
+    );
     perform(
       async () => {
-        await api("/api/goals", {
-          method: "POST",
-          body: JSON.stringify({
-            ...goalForm,
-            targetAmount: Number(goalForm.targetAmount),
-            depositAmount: Number(goalForm.depositAmount) || 0,
-            targetDate: goalForm.targetDate || null,
-          }),
-        });
+        try {
+          await api("/api/goals", {
+            method: "POST",
+            headers: { "Idempotency-Key": key },
+            body: JSON.stringify({
+              ...goalForm,
+              targetAmount: Number(goalForm.targetAmount),
+              depositAmount: Number(goalForm.depositAmount) || 0,
+              targetDate: goalForm.targetDate || null,
+            }),
+          });
+        } catch (requestError) {
+          if (
+            requestError.status === 409 &&
+            requestError.message.includes("idempotency key")
+          ) {
+            await refresh();
+            releaseIdempotencyKey(goalIdempotencyKey, "goal", user.id);
+          }
+          throw requestError;
+        }
+        await refresh();
+        releaseIdempotencyKey(goalIdempotencyKey, "goal", user.id);
         setGoalForm({
           goalType: "home",
           name: "",
@@ -256,7 +335,6 @@ export default function AccountPage() {
           depositAmount: "",
           targetDate: "",
         });
-        await refresh();
       },
       "Goal saved.",
     );
@@ -270,6 +348,15 @@ export default function AccountPage() {
       });
       setPreferences(updated);
     }, "Notification preferences updated.");
+
+  const withdrawConsent = (consentType) =>
+    perform(async () => {
+      await api("/api/consents/withdraw", {
+        method: "POST",
+        body: JSON.stringify({ consentType }),
+      });
+      await refresh();
+    }, "Optional consent withdrawn.");
 
   const askCoach = (event) => {
     event.preventDefault();
@@ -340,6 +427,21 @@ export default function AccountPage() {
       setOverview(null);
     });
   };
+
+  const optionalConsents = Object.values(
+    consents
+      .filter((record) => record.consentType !== "privacy_notice")
+      .reduce((latest, record) => {
+        if (
+          !latest[record.consentType] ||
+          new Date(record.grantedAt) >
+            new Date(latest[record.consentType].grantedAt)
+        ) {
+          latest[record.consentType] = record;
+        }
+        return latest;
+      }, {}),
+  );
 
   if (loading) {
     return (
@@ -705,6 +807,26 @@ export default function AccountPage() {
               <div><h2>Your data</h2><p>Review the <Link href="/privacy">prototype privacy notice</Link>.</p></div>
             </div>
             <p className="privacy-controls-copy">You can download a JSON copy of your saved entries or permanently delete your account and its associated profile, debt accounts, payments, goals, preferences, and sessions.</p>
+            <div className="consent-summary">
+              <strong>Optional data-processing consent</strong>
+              {optionalConsents.length ? optionalConsents.map((consent) => (
+                <div className="consent-row" key={consent.consentType}>
+                  <span>{consent.consentType.replaceAll("_", " ")}</span>
+                  {consent.withdrawnAt ? (
+                    <small>Withdrawn</small>
+                  ) : (
+                    <button
+                      className="consent-withdraw"
+                      disabled={busy}
+                      onClick={() => withdrawConsent(consent.consentType)}
+                    >
+                      Withdraw
+                    </button>
+                  )}
+                </div>
+              )) : <small>No optional provider-processing consents are active.</small>}
+              <small>The required prototype privacy-notice acknowledgement can be withdrawn by deleting your account.</small>
+            </div>
             <button className="delete-account-button" onClick={deleteAccount} disabled={busy}>Delete account and saved data</button>
           </section>
           <section className="account-card integration-status-card">

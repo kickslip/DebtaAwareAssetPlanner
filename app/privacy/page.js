@@ -25,7 +25,10 @@ export default function PrivacyPage() {
           one-way password hash, session-token hashes, financial profile
           entries, debt-account details, manually recorded payments, goals,
           notification preferences, and the time you acknowledged this notice.
-          Passwords and raw session tokens are not stored in the database.
+          Passwords and raw session tokens are not stored in the database. The
+          Android app encrypts its session, pending payment retry, and cached
+          widget summary with Android Keystore. Exact widget balances are
+          hidden unless you opt in on the device.
         </p>
         <h2>How the data is used</h2>
         <p>

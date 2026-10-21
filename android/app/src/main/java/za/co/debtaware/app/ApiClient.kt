@@ -22,10 +22,12 @@ data class DebtOverview(
     val debts: List<DebtAccount>,
 )
 
+data class MobileSession(val token: String, val userId: String)
+
 object ApiClient {
     private const val TIMEOUT_MS = 12_000
 
-    suspend fun signIn(email: String, password: String): String =
+    suspend fun signIn(email: String, password: String): MobileSession =
         withContext(Dispatchers.IO) {
             val response = request(
                 path = "/auth/login",
@@ -35,7 +37,10 @@ object ApiClient {
                     .put("password", password),
                 clientPlatform = true,
             )
-            response.getString("accessToken")
+            MobileSession(
+                token = response.getString("accessToken"),
+                userId = response.getJSONObject("user").getString("id"),
+            )
         }
 
     suspend fun loadOverview(token: String): DebtOverview =
@@ -70,12 +75,19 @@ object ApiClient {
         debtAccountId: String?,
         amount: Double,
         note: String,
+        idempotencyKey: String,
     ) = withContext(Dispatchers.IO) {
         val body = JSONObject()
             .put("amount", amount)
             .put("note", note.trim())
         if (debtAccountId != null) body.put("debtAccountId", debtAccountId)
-        request(path = "/api/payments", method = "POST", body = body, token = token)
+        request(
+            path = "/api/payments",
+            method = "POST",
+            body = body,
+            token = token,
+            idempotencyKey = idempotencyKey,
+        )
     }
 
     suspend fun signOut(token: String) = withContext(Dispatchers.IO) {
@@ -104,6 +116,7 @@ object ApiClient {
         body: JSONObject? = null,
         token: String? = null,
         clientPlatform: Boolean = false,
+        idempotencyKey: String? = null,
     ): JSONObject {
         val connection =
             (URL(BuildConfig.API_BASE_URL.trimEnd('/') + path).openConnection() as HttpURLConnection)
@@ -114,6 +127,9 @@ object ApiClient {
         if (body != null) connection.setRequestProperty("Content-Type", "application/json")
         if (clientPlatform) connection.setRequestProperty("X-Client-Platform", "android")
         if (token != null) connection.setRequestProperty("Authorization", "Bearer $token")
+        if (idempotencyKey != null) {
+            connection.setRequestProperty("Idempotency-Key", idempotencyKey)
+        }
 
         return try {
             if (body != null) {

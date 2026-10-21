@@ -3,14 +3,19 @@ import cors from "cors";
 import express from "express";
 import { rateLimit } from "express-rate-limit";
 import helmet from "helmet";
+import { Prisma } from "../generated/prisma/client.ts";
 import { z } from "zod";
 import { calculateAffordability } from "../lib/affordability.js";
 import {
+  createIdempotently,
+  requestFingerprint,
+} from "./idempotency.js";
+import {
   createSessionToken,
+  dummyPasswordHash,
   hashPassword,
   hashSessionToken,
   readSessionToken,
-  dummyPasswordHash,
   verifyPassword,
 } from "./security.js";
 import { getIntegrationStatus } from "./providers/status.js";
@@ -30,6 +35,12 @@ const allowedOrigins = new Set(
     .map((origin) => origin.trim())
     .filter(Boolean),
 );
+if (
+  process.env.NODE_ENV === "production" &&
+  [...allowedOrigins].some((origin) => new URL(origin).protocol !== "https:")
+) {
+  throw new Error("All browser origins must use HTTPS in production.");
+}
 
 class ApiError extends Error {
   constructor(status, message, details) {
@@ -41,21 +52,30 @@ class ApiError extends Error {
 
 const emailSchema = z.string().trim().email().max(254);
 const passwordSchema = z.string().min(12).max(128);
-const amountSchema = z.coerce.number().finite().min(0).max(1_000_000_000);
+const amountSchema = z.coerce
+  .number()
+  .finite()
+  .min(0)
+  .max(1_000_000_000)
+  .refine((value) => Math.abs(value * 100 - Math.round(value * 100)) < 1e-6);
 const positiveAmountSchema = amountSchema.min(0.01);
 const uuidSchema = z.string().uuid();
+const idempotencyKeySchema = z
+  .string()
+  .trim()
+  .min(16)
+  .max(128)
+  .regex(/^[A-Za-z0-9._~-]+$/);
 
 const registerSchema = z.object({
   email: emailSchema,
   password: passwordSchema,
   privacyConsent: z.literal(true),
 });
-
 const loginSchema = z.object({
   email: emailSchema,
   password: z.string().min(1).max(128),
 });
-
 const profileSchema = z
   .object({
     grossMonthlyIncome: amountSchema,
@@ -65,7 +85,6 @@ const profileSchema = z
   })
   .partial()
   .refine((value) => Object.keys(value).length > 0);
-
 const debtSchema = z.object({
   name: z.string().trim().min(1).max(80),
   debtType: z.enum(["credit_card", "personal_loan", "vehicle", "home", "other"]),
@@ -73,14 +92,12 @@ const debtSchema = z.object({
   monthlyPayment: amountSchema,
   annualRate: amountSchema.max(100),
 });
-
 const paymentSchema = z.object({
   debtAccountId: uuidSchema.nullable().optional(),
   amount: positiveAmountSchema,
   note: z.string().trim().max(250).default(""),
   paidAt: z.string().datetime().optional(),
 });
-
 const goalSchema = z.object({
   goalType: z.enum(["home", "car", "other"]),
   name: z.string().trim().min(1).max(100),
@@ -88,14 +105,12 @@ const goalSchema = z.object({
   depositAmount: amountSchema,
   targetDate: z.string().date().nullable().optional(),
 });
-
 const negotiationSchema = z.object({
   creditorName: z.string().trim().min(1).max(80),
   proposalType: z.enum(["restructure", "consolidate"]),
   preferredMonthlyPayment: positiveAmountSchema,
   reason: z.string().trim().min(1).max(500),
 });
-
 const preferenceSchema = z
   .object({
     paymentRemindersEnabled: z.boolean(),
@@ -103,6 +118,9 @@ const preferenceSchema = z
   })
   .partial()
   .refine((value) => Object.keys(value).length > 0);
+const withdrawConsentSchema = z.object({
+  consentType: z.enum(["open_banking", "ai_processing", "marketing"]),
+});
 
 function parse(schema, value) {
   const result = schema.safeParse(value);
@@ -119,15 +137,12 @@ function parse(schema, value) {
   return result.data;
 }
 
-function numericRecord(record) {
-  return Object.fromEntries(
-    Object.entries(record).map(([key, value]) => [
-      key,
-      value === null || value === undefined || key === "user_id"
-        ? value
-        : Number(value),
-    ]),
-  );
+function idempotencyKey(request) {
+  return parse(idempotencyKeySchema, request.get("idempotency-key"));
+}
+
+function decimal(value) {
+  return new Prisma.Decimal(value.toFixed(2));
 }
 
 function setSessionCookie(response, token) {
@@ -140,32 +155,71 @@ function setSessionCookie(response, token) {
   });
 }
 
-async function createSession(pool, userId) {
-  const token = createSessionToken();
-  const expiresAt = new Date(Date.now() + sessionLifetimeMs);
-  await pool.query(
-    "INSERT INTO sessions (id, user_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)",
-    [randomUUID(), userId, hashSessionToken(token), expiresAt],
-  );
-  return { token, expiresAt };
+function mapProfile(profile) {
+  if (!profile) return null;
+  return {
+    grossMonthlyIncome: Number(profile.grossMonthlyIncome),
+    takeHomeIncome: Number(profile.takeHomeIncome),
+    essentialExpenses: Number(profile.essentialExpenses),
+    monthlyBuffer: Number(profile.monthlyBuffer),
+    updatedAt: profile.updatedAt,
+  };
 }
 
-function requireAuth(pool) {
+function mapDebt(debt) {
+  return {
+    id: debt.id,
+    name: debt.name,
+    debtType: debt.debtType,
+    balance: Number(debt.balance),
+    monthlyPayment: Number(debt.monthlyPayment),
+    annualRate: Number(debt.annualRate),
+    createdAt: debt.createdAt,
+    updatedAt: debt.updatedAt,
+  };
+}
+
+function mapPayment(payment) {
+  return {
+    id: payment.id,
+    debtAccountId: payment.debtAccountId,
+    debtName: payment.debtAccount?.name || null,
+    amount: Number(payment.amount),
+    note: payment.note,
+    paidAt: payment.paidAt,
+    createdAt: payment.createdAt,
+  };
+}
+
+function mapGoal(goal) {
+  return {
+    id: goal.id,
+    goalType: goal.goalType,
+    name: goal.name,
+    targetAmount: Number(goal.targetAmount),
+    depositAmount: Number(goal.depositAmount),
+    targetDate: goal.targetDate,
+    createdAt: goal.createdAt,
+    updatedAt: goal.updatedAt,
+  };
+}
+
+function requireAuth(prisma) {
   return async (request, response, next) => {
     try {
       const token = readSessionToken(request);
       if (!token || token.length > 128) {
         throw new ApiError(401, "Sign in to continue.");
       }
-      const result = await pool.query(
-        `SELECT users.id, users.email
-         FROM sessions
-         JOIN users ON users.id = sessions.user_id
-         WHERE sessions.token_hash = $1 AND sessions.expires_at > NOW()`,
-        [hashSessionToken(token)],
-      );
-      if (!result.rowCount) throw new ApiError(401, "Sign in to continue.");
-      request.auth = { ...result.rows[0], token };
+      const session = await prisma.session.findFirst({
+        where: {
+          tokenHash: hashSessionToken(token),
+          expiresAt: { gt: new Date() },
+        },
+        select: { user: { select: { id: true, email: true } } },
+      });
+      if (!session) throw new ApiError(401, "Sign in to continue.");
+      request.auth = { ...session.user, token };
       next();
     } catch (error) {
       next(error);
@@ -192,38 +246,18 @@ function createApiLimiter() {
   });
 }
 
-function mapDebt(row) {
-  return {
-    id: row.id,
-    name: row.name,
-    debtType: row.debt_type,
-    balance: Number(row.balance),
-    monthlyPayment: Number(row.monthly_payment),
-    annualRate: Number(row.annual_rate),
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-  };
+function sendCreated(response, record, replayed, mapper) {
+  response.status(replayed ? 200 : 201).json(mapper(record));
 }
 
-function mapPayment(row) {
-  return {
-    id: row.id,
-    debtAccountId: row.debt_account_id,
-    debtName: row.debt_name || null,
-    amount: Number(row.amount),
-    note: row.note,
-    paidAt: row.paid_at,
-    createdAt: row.created_at,
-  };
-}
-
-export function createApp({ pool }) {
+export function createApp({ prisma }) {
   const app = express();
-  const auth = requireAuth(pool);
+  const auth = requireAuth(prisma);
   const authLimiter = createAuthLimiter();
   const apiLimiter = createApiLimiter();
 
   app.disable("x-powered-by");
+  app.set("trust proxy", process.env.TRUST_PROXY === "true" ? 1 : false);
   app.use(helmet());
   app.use(
     cors({
@@ -232,7 +266,12 @@ export function createApp({ pool }) {
       },
       credentials: true,
       methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-      allowedHeaders: ["Content-Type", "Authorization", "X-Client-Platform"],
+      allowedHeaders: [
+        "Content-Type",
+        "Authorization",
+        "X-Client-Platform",
+        "Idempotency-Key",
+      ],
     }),
   );
   app.use((request, response, next) => {
@@ -249,7 +288,7 @@ export function createApp({ pool }) {
 
   app.get("/health", async (request, response, next) => {
     try {
-      await pool.query("SELECT 1");
+      await prisma.$queryRaw`SELECT 1`;
       response.json({ status: "ok" });
     } catch (error) {
       next(error);
@@ -259,84 +298,89 @@ export function createApp({ pool }) {
   app.post("/auth/register", authLimiter, async (request, response) => {
     const input = parse(registerSchema, request.body);
     const email = input.email.toLowerCase();
-    const client = await pool.connect();
-    const userId = randomUUID();
+    const token = createSessionToken();
+    const passwordHash = await hashPassword(input.password);
+    const expiresAt = new Date(Date.now() + sessionLifetimeMs);
 
     try {
-      await client.query("BEGIN");
-      const user = await client.query(
-        `INSERT INTO users (id, email, password_hash, privacy_consent_at)
-         VALUES ($1, $2, $3, NOW())
-         RETURNING id, email, created_at`,
-        [userId, email, await hashPassword(input.password)],
-      );
-      await client.query(
-        "INSERT INTO financial_profiles (user_id) VALUES ($1)",
-        [userId],
-      );
-      await client.query(
-        "INSERT INTO notification_preferences (user_id) VALUES ($1)",
-        [userId],
-      );
-      await client.query(
-        `INSERT INTO consent_records (id, user_id, consent_type, policy_version)
-         VALUES ($1, $2, 'privacy_notice', $3)`,
-        [randomUUID(), userId, privacyPolicyVersion],
-      );
-      const token = createSessionToken();
-      const expiresAt = new Date(Date.now() + sessionLifetimeMs);
-      await client.query(
-        "INSERT INTO sessions (id, user_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)",
-        [randomUUID(), userId, hashSessionToken(token), expiresAt],
-      );
-      await client.query("COMMIT");
+      const user = await prisma.$transaction(async (tx) => {
+        const created = await tx.user.create({
+          data: {
+            email,
+            passwordHash,
+            privacyConsentAt: new Date(),
+            financialProfile: { create: {} },
+            notificationPreferences: { create: {} },
+            consentRecords: {
+              create: {
+                consentType: "privacy_notice",
+                policyVersion: privacyPolicyVersion,
+              },
+            },
+          },
+          select: { id: true, email: true, createdAt: true },
+        });
+        await tx.session.create({
+          data: {
+            userId: created.id,
+            tokenHash: hashSessionToken(token),
+            expiresAt,
+          },
+        });
+        return created;
+      });
       setSessionCookie(response, token);
       response.status(201).json({
-        user: user.rows[0],
+        user,
         ...(request.get("x-client-platform") === "android"
           ? { accessToken: token }
           : {}),
       });
     } catch (error) {
-      await client.query("ROLLBACK");
-      if (error.code === "23505") {
+      if (error.code === "P2002") {
         throw new ApiError(409, "An account with that email already exists.");
       }
       throw error;
-    } finally {
-      client.release();
     }
   });
 
   app.post("/auth/login", authLimiter, async (request, response) => {
     const input = parse(loginSchema, request.body);
-    const result = await pool.query(
-      "SELECT id, email, password_hash, created_at FROM users WHERE email = $1",
-      [input.email.toLowerCase()],
-    );
-    const user = result.rows[0];
+    const user = await prisma.user.findUnique({
+      where: { email: input.email.toLowerCase() },
+    });
     const passwordMatches = await verifyPassword(
       input.password,
-      user?.password_hash || (await dummyPasswordHash),
+      user?.passwordHash || (await dummyPasswordHash),
     );
     if (!user || !passwordMatches) {
       throw new ApiError(401, "Invalid email or password.");
     }
 
-    const { token } = await createSession(pool, user.id);
+    const token = createSessionToken();
+    await prisma.session.create({
+      data: {
+        userId: user.id,
+        tokenHash: hashSessionToken(token),
+        expiresAt: new Date(Date.now() + sessionLifetimeMs),
+      },
+    });
     setSessionCookie(response, token);
     response.json({
-      user: { id: user.id, email: user.email, created_at: user.created_at },
+      user: { id: user.id, email: user.email, createdAt: user.createdAt },
       ...(request.get("x-client-platform") === "android"
         ? { accessToken: token }
         : {}),
     });
   });
 
-  app.post("/auth/logout", auth, async (request, response) => {
-    await pool.query("DELETE FROM sessions WHERE token_hash = $1", [
-      hashSessionToken(request.auth.token),
-    ]);
+  app.post("/auth/logout", async (request, response) => {
+    const token = readSessionToken(request);
+    if (token && token.length <= 128) {
+      await prisma.session.deleteMany({
+        where: { tokenHash: hashSessionToken(token) },
+      });
+    }
     response.clearCookie("debtaware_session", {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
@@ -347,36 +391,37 @@ export function createApp({ pool }) {
   });
 
   app.get("/auth/me", auth, (request, response) => {
-    response.json({ user: { id: request.auth.id, email: request.auth.email } });
+    response.json({
+      user: { id: request.auth.id, email: request.auth.email },
+    });
   });
 
   app.get("/api/account/export", auth, async (request, response) => {
     const [profile, debts, payments, goals, preferences, consents] =
       await Promise.all([
-        pool.query(
-          "SELECT * FROM financial_profiles WHERE user_id = $1",
-          [request.auth.id],
-        ),
-        pool.query(
-          "SELECT id, name, debt_type, balance, monthly_payment, annual_rate, created_at, updated_at FROM debt_accounts WHERE user_id = $1 ORDER BY created_at",
-          [request.auth.id],
-        ),
-        pool.query(
-          "SELECT id, debt_account_id, amount, note, paid_at, created_at FROM payments WHERE user_id = $1 ORDER BY paid_at",
-          [request.auth.id],
-        ),
-        pool.query(
-          "SELECT id, goal_type, name, target_amount, deposit_amount, target_date, created_at, updated_at FROM goals WHERE user_id = $1 ORDER BY created_at",
-          [request.auth.id],
-        ),
-        pool.query(
-          "SELECT payment_reminders_enabled, goal_updates_enabled, updated_at FROM notification_preferences WHERE user_id = $1",
-          [request.auth.id],
-        ),
-        pool.query(
-          "SELECT consent_type, policy_version, granted_at, withdrawn_at FROM consent_records WHERE user_id = $1 ORDER BY granted_at",
-          [request.auth.id],
-        ),
+        prisma.financialProfile.findUnique({
+          where: { userId: request.auth.id },
+        }),
+        prisma.debtAccount.findMany({
+          where: { userId: request.auth.id },
+          orderBy: { createdAt: "asc" },
+        }),
+        prisma.payment.findMany({
+          where: { userId: request.auth.id },
+          include: { debtAccount: { select: { name: true } } },
+          orderBy: { paidAt: "asc" },
+        }),
+        prisma.goal.findMany({
+          where: { userId: request.auth.id },
+          orderBy: { createdAt: "asc" },
+        }),
+        prisma.notificationPreference.findUnique({
+          where: { userId: request.auth.id },
+        }),
+        prisma.consentRecord.findMany({
+          where: { userId: request.auth.id },
+          orderBy: { grantedAt: "asc" },
+        }),
       ]);
     response.setHeader(
       "Content-Disposition",
@@ -385,37 +430,34 @@ export function createApp({ pool }) {
     response.json({
       exportedAt: new Date().toISOString(),
       account: { id: request.auth.id, email: request.auth.email },
-      financialProfile: profile.rows[0] || null,
-      debtAccounts: debts.rows,
-      payments: payments.rows,
-      goals: goals.rows,
-      notificationPreferences: preferences.rows[0] || null,
-      consentRecords: consents.rows,
+      financialProfile: mapProfile(profile),
+      debtAccounts: debts.map(mapDebt),
+      payments: payments.map(mapPayment),
+      goals: goals.map(mapGoal),
+      notificationPreferences: preferences,
+      consentRecords: consents,
     });
   });
 
   app.delete("/api/account", auth, async (request, response) => {
     const input = parse(
-      z.object({
-        email: emailSchema,
-        password: passwordSchema,
-      }),
+      z.object({ email: emailSchema, password: passwordSchema }),
       request.body,
     );
     if (input.email.toLowerCase() !== request.auth.email) {
       throw new ApiError(403, "Email confirmation did not match.");
     }
-    const user = await pool.query(
-      "SELECT password_hash FROM users WHERE id = $1",
-      [request.auth.id],
-    );
+    const user = await prisma.user.findUnique({
+      where: { id: request.auth.id },
+      select: { passwordHash: true },
+    });
     if (
-      !user.rowCount ||
-      !(await verifyPassword(input.password, user.rows[0].password_hash))
+      !user ||
+      !(await verifyPassword(input.password, user.passwordHash))
     ) {
       throw new ApiError(403, "Password confirmation failed.");
     }
-    await pool.query("DELETE FROM users WHERE id = $1", [request.auth.id]);
+    await prisma.user.delete({ where: { id: request.auth.id } });
     response.clearCookie("debtaware_session", {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
@@ -425,24 +467,32 @@ export function createApp({ pool }) {
     response.status(204).end();
   });
 
+  app.get("/api/consents", auth, async (request, response) => {
+    const records = await prisma.consentRecord.findMany({
+      where: { userId: request.auth.id },
+      orderBy: { grantedAt: "asc" },
+    });
+    response.json(records);
+  });
+
+  app.post("/api/consents/withdraw", auth, async (request, response) => {
+    const input = parse(withdrawConsentSchema, request.body);
+    await prisma.consentRecord.updateMany({
+      where: {
+        userId: request.auth.id,
+        consentType: input.consentType,
+        withdrawnAt: null,
+      },
+      data: { withdrawnAt: new Date() },
+    });
+    response.status(204).end();
+  });
+
   app.get("/api/profile", auth, async (request, response) => {
-    const result = await pool.query(
-      `SELECT gross_monthly_income, take_home_income, essential_expenses,
-              monthly_buffer, updated_at
-       FROM financial_profiles WHERE user_id = $1`,
-      [request.auth.id],
-    );
-    response.json(
-      result.rows[0]
-        ? {
-            grossMonthlyIncome: Number(result.rows[0].gross_monthly_income),
-            takeHomeIncome: Number(result.rows[0].take_home_income),
-            essentialExpenses: Number(result.rows[0].essential_expenses),
-            monthlyBuffer: Number(result.rows[0].monthly_buffer),
-            updatedAt: result.rows[0].updated_at,
-          }
-        : null,
-    );
+    const profile = await prisma.financialProfile.findUnique({
+      where: { userId: request.auth.id },
+    });
+    response.json(mapProfile(profile));
   });
 
   app.get("/api/integrations", auth, (request, response) => {
@@ -451,141 +501,128 @@ export function createApp({ pool }) {
 
   app.patch("/api/profile", auth, async (request, response) => {
     const input = parse(profileSchema, request.body);
-    const columns = {
-      grossMonthlyIncome: "gross_monthly_income",
-      takeHomeIncome: "take_home_income",
-      essentialExpenses: "essential_expenses",
-      monthlyBuffer: "monthly_buffer",
-    };
-    const entries = Object.entries(input);
-    const assignments = entries.map(
-      ([key], index) => `${columns[key]} = $${index + 2}`,
-    );
-    const values = entries.map(([, value]) => value);
-    const result = await pool.query(
-      `UPDATE financial_profiles
-       SET ${assignments.join(", ")}, updated_at = NOW()
-       WHERE user_id = $1
-       RETURNING gross_monthly_income, take_home_income,
-                 essential_expenses, monthly_buffer, updated_at`,
-      [request.auth.id, ...values],
-    );
-    response.json({
-      grossMonthlyIncome: Number(result.rows[0].gross_monthly_income),
-      takeHomeIncome: Number(result.rows[0].take_home_income),
-      essentialExpenses: Number(result.rows[0].essential_expenses),
-      monthlyBuffer: Number(result.rows[0].monthly_buffer),
-      updatedAt: result.rows[0].updated_at,
+    const profile = await prisma.financialProfile.update({
+      where: { userId: request.auth.id },
+      data: Object.fromEntries(
+        Object.entries(input).map(([key, value]) => [key, decimal(value)]),
+      ),
     });
+    response.json(mapProfile(profile));
   });
 
   app.get("/api/debts", auth, async (request, response) => {
-    const result = await pool.query(
-      `SELECT id, name, debt_type, balance, monthly_payment, annual_rate,
-              created_at, updated_at
-       FROM debt_accounts WHERE user_id = $1 ORDER BY created_at`,
-      [request.auth.id],
-    );
-    response.json(result.rows.map(mapDebt));
+    const debts = await prisma.debtAccount.findMany({
+      where: { userId: request.auth.id },
+      orderBy: { createdAt: "asc" },
+    });
+    response.json(debts.map(mapDebt));
   });
 
   app.post("/api/debts", auth, async (request, response) => {
     const input = parse(debtSchema, request.body);
-    const result = await pool.query(
-      `INSERT INTO debt_accounts
-       (id, user_id, name, debt_type, balance, monthly_payment, annual_rate)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING id, name, debt_type, balance, monthly_payment, annual_rate,
-                 created_at, updated_at`,
-      [
-        randomUUID(),
-        request.auth.id,
-        input.name,
-        input.debtType,
-        input.balance,
-        input.monthlyPayment,
-        input.annualRate,
-      ],
-    );
-    response.status(201).json(mapDebt(result.rows[0]));
+    const key = idempotencyKey(request);
+    const fingerprint = requestFingerprint(input);
+    const where = {
+      userId_idempotencyKey: {
+        userId: request.auth.id,
+        idempotencyKey: key,
+      },
+    };
+    const result = await createIdempotently({
+      findExisting: () => prisma.debtAccount.findUnique({ where }),
+      create: () =>
+        prisma.debtAccount.create({
+          data: {
+            userId: request.auth.id,
+            name: input.name,
+            debtType: input.debtType,
+            balance: decimal(input.balance),
+            monthlyPayment: decimal(input.monthlyPayment),
+            annualRate: decimal(input.annualRate),
+            idempotencyKey: key,
+            requestHash: fingerprint,
+          },
+        }),
+      fingerprint,
+    });
+    sendCreated(response, result.record, result.replayed, mapDebt);
   });
 
   app.get("/api/payments", auth, async (request, response) => {
-    const result = await pool.query(
-      `SELECT payments.id, payments.debt_account_id, debt_accounts.name AS debt_name,
-              payments.amount, payments.note, payments.paid_at, payments.created_at
-       FROM payments
-       LEFT JOIN debt_accounts ON debt_accounts.id = payments.debt_account_id
-       WHERE payments.user_id = $1
-       ORDER BY payments.paid_at DESC LIMIT 100`,
-      [request.auth.id],
-    );
-    response.json(result.rows.map(mapPayment));
+    const payments = await prisma.payment.findMany({
+      where: { userId: request.auth.id },
+      include: { debtAccount: { select: { name: true } } },
+      orderBy: { paidAt: "desc" },
+      take: 100,
+    });
+    response.json(payments.map(mapPayment));
   });
 
   app.post("/api/payments", auth, async (request, response) => {
     const input = parse(paymentSchema, request.body);
-    const client = await pool.connect();
-    const paymentId = randomUUID();
+    const key = idempotencyKey(request);
     const paidAt = input.paidAt ? new Date(input.paidAt) : new Date();
-
-    try {
-      await client.query("BEGIN");
-      if (input.debtAccountId) {
-        const debt = await client.query(
-          "SELECT id FROM debt_accounts WHERE id = $1 AND user_id = $2 FOR UPDATE",
-          [input.debtAccountId, request.auth.id],
-        );
-        if (!debt.rowCount) throw new ApiError(404, "Debt account not found.");
-        await client.query(
-          `UPDATE debt_accounts
-           SET balance = GREATEST(0, balance - $1), updated_at = NOW()
-           WHERE id = $2 AND user_id = $3`,
-          [input.amount, input.debtAccountId, request.auth.id],
-        );
-      }
-      const result = await client.query(
-        `INSERT INTO payments (id, user_id, debt_account_id, amount, note, paid_at)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         RETURNING id, debt_account_id, amount, note, paid_at, created_at`,
-        [
-          paymentId,
-          request.auth.id,
-          input.debtAccountId || null,
-          input.amount,
-          input.note,
-          paidAt,
-        ],
-      );
-      await client.query("COMMIT");
-      response.status(201).json(mapPayment(result.rows[0]));
-    } catch (error) {
-      await client.query("ROLLBACK");
-      throw error;
-    } finally {
-      client.release();
-    }
+    const fingerprint = requestFingerprint({
+      ...input,
+      paidAt: input.paidAt ? paidAt.toISOString() : null,
+    });
+    const where = {
+      userId_idempotencyKey: {
+        userId: request.auth.id,
+        idempotencyKey: key,
+      },
+    };
+    const result = await createIdempotently({
+      findExisting: () =>
+        prisma.payment.findUnique({
+          where,
+          include: { debtAccount: { select: { name: true } } },
+        }),
+      create: () =>
+        prisma.$transaction(async (tx) => {
+          if (input.debtAccountId) {
+            const debts = await tx.$queryRaw`
+              SELECT "balance" FROM "debt_accounts"
+              WHERE "id" = ${input.debtAccountId}::uuid
+                AND "user_id" = ${request.auth.id}::uuid
+              FOR UPDATE
+            `;
+            if (!debts.length) {
+              throw new ApiError(404, "Debt account not found.");
+            }
+            const nextBalance = Math.max(
+              0,
+              Number(debts[0].balance) - input.amount,
+            );
+            await tx.debtAccount.update({
+              where: { id: input.debtAccountId },
+              data: { balance: decimal(nextBalance) },
+            });
+          }
+          return tx.payment.create({
+            data: {
+              userId: request.auth.id,
+              debtAccountId: input.debtAccountId || null,
+              amount: decimal(input.amount),
+              note: input.note,
+              paidAt,
+              idempotencyKey: key,
+              requestHash: fingerprint,
+            },
+            include: { debtAccount: { select: { name: true } } },
+          });
+        }),
+      fingerprint,
+    });
+    sendCreated(response, result.record, result.replayed, mapPayment);
   });
 
   app.get("/api/goals", auth, async (request, response) => {
-    const result = await pool.query(
-      `SELECT id, goal_type, name, target_amount, deposit_amount, target_date,
-              created_at, updated_at
-       FROM goals WHERE user_id = $1 ORDER BY created_at DESC`,
-      [request.auth.id],
-    );
-    response.json(
-      result.rows.map((row) => ({
-        id: row.id,
-        goalType: row.goal_type,
-        name: row.name,
-        targetAmount: Number(row.target_amount),
-        depositAmount: Number(row.deposit_amount),
-        targetDate: row.target_date,
-        createdAt: row.created_at,
-        updatedAt: row.updated_at,
-      })),
-    );
+    const goals = await prisma.goal.findMany({
+      where: { userId: request.auth.id },
+      orderBy: { createdAt: "desc" },
+    });
+    response.json(goals.map(mapGoal));
   });
 
   app.post("/api/goals", auth, async (request, response) => {
@@ -593,121 +630,95 @@ export function createApp({ pool }) {
     if (input.depositAmount > input.targetAmount) {
       throw new ApiError(400, "Deposit cannot exceed the goal amount.");
     }
-    const result = await pool.query(
-      `INSERT INTO goals
-       (id, user_id, goal_type, name, target_amount, deposit_amount, target_date)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING id, goal_type, name, target_amount, deposit_amount,
-                 target_date, created_at, updated_at`,
-      [
-        randomUUID(),
-        request.auth.id,
-        input.goalType,
-        input.name,
-        input.targetAmount,
-        input.depositAmount,
-        input.targetDate || null,
-      ],
-    );
-    const row = result.rows[0];
-    response.status(201).json({
-      id: row.id,
-      goalType: row.goal_type,
-      name: row.name,
-      targetAmount: Number(row.target_amount),
-      depositAmount: Number(row.deposit_amount),
-      targetDate: row.target_date,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
+    const key = idempotencyKey(request);
+    const fingerprint = requestFingerprint(input);
+    const where = {
+      userId_idempotencyKey: {
+        userId: request.auth.id,
+        idempotencyKey: key,
+      },
+    };
+    const result = await createIdempotently({
+      findExisting: () => prisma.goal.findUnique({ where }),
+      create: () =>
+        prisma.goal.create({
+          data: {
+            userId: request.auth.id,
+            goalType: input.goalType,
+            name: input.name,
+            targetAmount: decimal(input.targetAmount),
+            depositAmount: decimal(input.depositAmount),
+            targetDate: input.targetDate
+              ? new Date(`${input.targetDate}T00:00:00.000Z`)
+              : null,
+            idempotencyKey: key,
+            requestHash: fingerprint,
+          },
+        }),
+      fingerprint,
     });
+    sendCreated(response, result.record, result.replayed, mapGoal);
   });
 
   app.get("/api/notification-preferences", auth, async (request, response) => {
-    const result = await pool.query(
-      `SELECT payment_reminders_enabled, goal_updates_enabled
-       FROM notification_preferences WHERE user_id = $1`,
-      [request.auth.id],
-    );
+    const preferences = await prisma.notificationPreference.findUnique({
+      where: { userId: request.auth.id },
+    });
     response.json({
       paymentRemindersEnabled:
-        result.rows[0]?.payment_reminders_enabled ?? false,
-      goalUpdatesEnabled: result.rows[0]?.goal_updates_enabled ?? false,
+        preferences?.paymentRemindersEnabled ?? false,
+      goalUpdatesEnabled: preferences?.goalUpdatesEnabled ?? false,
     });
   });
 
   app.patch("/api/notification-preferences", auth, async (request, response) => {
     const input = parse(preferenceSchema, request.body);
-    const current = await pool.query(
-      `SELECT payment_reminders_enabled, goal_updates_enabled
-       FROM notification_preferences WHERE user_id = $1`,
-      [request.auth.id],
-    );
+    const current = await prisma.notificationPreference.findUnique({
+      where: { userId: request.auth.id },
+    });
     const preferences = {
       paymentRemindersEnabled:
         input.paymentRemindersEnabled ??
-        current.rows[0]?.payment_reminders_enabled ??
+        current?.paymentRemindersEnabled ??
         false,
       goalUpdatesEnabled:
-        input.goalUpdatesEnabled ??
-        current.rows[0]?.goal_updates_enabled ??
-        false,
+        input.goalUpdatesEnabled ?? current?.goalUpdatesEnabled ?? false,
     };
-    await pool.query(
-      `INSERT INTO notification_preferences
-       (user_id, payment_reminders_enabled, goal_updates_enabled, updated_at)
-       VALUES ($1, $2, $3, NOW())
-       ON CONFLICT (user_id) DO UPDATE SET
-       payment_reminders_enabled = EXCLUDED.payment_reminders_enabled,
-       goal_updates_enabled = EXCLUDED.goal_updates_enabled,
-       updated_at = NOW()`,
-      [
-        request.auth.id,
-        preferences.paymentRemindersEnabled,
-        preferences.goalUpdatesEnabled,
-      ],
-    );
-    response.json(preferences);
+    const updated = await prisma.notificationPreference.upsert({
+      where: { userId: request.auth.id },
+      create: { userId: request.auth.id, ...preferences },
+      update: preferences,
+    });
+    response.json({
+      paymentRemindersEnabled: updated.paymentRemindersEnabled,
+      goalUpdatesEnabled: updated.goalUpdatesEnabled,
+    });
   });
 
   app.get("/api/overview", auth, async (request, response) => {
-    const [profileResult, debtResult, paymentResult, goalResult] =
-      await Promise.all([
-        pool.query(
-          `SELECT gross_monthly_income, take_home_income, essential_expenses,
-                  monthly_buffer
-           FROM financial_profiles WHERE user_id = $1`,
-          [request.auth.id],
-        ),
-        pool.query(
-          `SELECT id, name, debt_type, balance, monthly_payment, annual_rate,
-                  created_at, updated_at
-           FROM debt_accounts WHERE user_id = $1 ORDER BY created_at`,
-          [request.auth.id],
-        ),
-        pool.query(
-          `SELECT payments.id, payments.debt_account_id,
-                  debt_accounts.name AS debt_name, payments.amount,
-                  payments.note, payments.paid_at, payments.created_at
-           FROM payments
-           LEFT JOIN debt_accounts ON debt_accounts.id = payments.debt_account_id
-           WHERE payments.user_id = $1
-           ORDER BY payments.paid_at DESC LIMIT 10`,
-          [request.auth.id],
-        ),
-        pool.query(
-          `SELECT id, goal_type, name, target_amount, deposit_amount, target_date
-           FROM goals WHERE user_id = $1 ORDER BY created_at DESC`,
-          [request.auth.id],
-        ),
-      ]);
-    const profileRow = profileResult.rows[0] || {};
-    const profile = {
-      grossMonthlyIncome: Number(profileRow.gross_monthly_income || 0),
-      takeHomeIncome: Number(profileRow.take_home_income || 0),
-      essentialExpenses: Number(profileRow.essential_expenses || 0),
-      monthlyBuffer: Number(profileRow.monthly_buffer || 0),
+    const [profileResult, debtRows, paymentRows, goalRows] = await Promise.all([
+      prisma.financialProfile.findUnique({
+        where: { userId: request.auth.id },
+      }),
+      prisma.debtAccount.findMany({ where: { userId: request.auth.id } }),
+      prisma.payment.findMany({
+        where: { userId: request.auth.id },
+        include: { debtAccount: { select: { name: true } } },
+        orderBy: { paidAt: "desc" },
+        take: 10,
+      }),
+      prisma.goal.findMany({
+        where: { userId: request.auth.id },
+        orderBy: { createdAt: "desc" },
+      }),
+    ]);
+    const profile = mapProfile(profileResult) || {
+      grossMonthlyIncome: 0,
+      takeHomeIncome: 0,
+      essentialExpenses: 0,
+      monthlyBuffer: 0,
     };
-    const debts = debtResult.rows.map(mapDebt);
+    const debts = debtRows.map(mapDebt);
     const totalDebt = debts.reduce((sum, debt) => sum + debt.balance, 0);
     const monthlyDebtPayment = debts.reduce(
       (sum, debt) => sum + debt.monthlyPayment,
@@ -726,25 +737,16 @@ export function createApp({ pool }) {
       annualRatePercent: 0,
       termMonths: 0,
     });
-
     response.json({
       profile,
       debts,
-      goals: goalResult.rows.map((row) => ({
-        id: row.id,
-        goalType: row.goal_type,
-        name: row.name,
-        targetAmount: Number(row.target_amount),
-        depositAmount: Number(row.deposit_amount),
-        targetDate: row.target_date,
-      })),
-      recentPayments: paymentResult.rows.map(mapPayment),
+      goals: goalRows.map(mapGoal),
+      recentPayments: paymentRows.map(mapPayment),
       overview: {
         totalDebt,
         monthlyDebtPayment,
         debtToIncomeRatio: affordability.debtToIncomeRatio,
-        monthlyRoom:
-          affordability.monthlyCapacityAfterPaydown,
+        monthlyRoom: affordability.monthlyCapacityAfterPaydown,
       },
     });
   });
@@ -754,50 +756,44 @@ export function createApp({ pool }) {
       z.object({ question: z.string().trim().min(1).max(500) }),
       request.body,
     );
-    const [profileResult, debtResult] = await Promise.all([
-      pool.query(
-        `SELECT gross_monthly_income, take_home_income, essential_expenses,
-                monthly_buffer
-         FROM financial_profiles WHERE user_id = $1`,
-        [request.auth.id],
-      ),
-      pool.query(
-        `SELECT COALESCE(SUM(balance), 0) AS total_debt,
-                COALESCE(SUM(monthly_payment), 0) AS monthly_debt_payment
-         FROM debt_accounts WHERE user_id = $1`,
-        [request.auth.id],
-      ),
+    const [profileResult, debtSummary] = await Promise.all([
+      prisma.financialProfile.findUnique({
+        where: { userId: request.auth.id },
+      }),
+      prisma.debtAccount.aggregate({
+        where: { userId: request.auth.id },
+        _sum: { balance: true, monthlyPayment: true },
+      }),
     ]);
-    const profileRow = profileResult.rows[0] || {};
-    const profile = numericRecord({
-      grossIncome: profileRow.gross_monthly_income || 0,
-      takeHomeIncome: profileRow.take_home_income || 0,
-      essentialExpenses: profileRow.essential_expenses || 0,
-      monthlyBuffer: profileRow.monthly_buffer || 0,
-      totalDebt: debtResult.rows[0].total_debt,
-      monthlyDebtPayment: debtResult.rows[0].monthly_debt_payment,
-    });
+    const profile = mapProfile(profileResult) || {
+      grossMonthlyIncome: 0,
+      takeHomeIncome: 0,
+      essentialExpenses: 0,
+      monthlyBuffer: 0,
+    };
+    const totalDebt = Number(debtSummary._sum.balance || 0);
+    const monthlyDebtPayment = Number(debtSummary._sum.monthlyPayment || 0);
     const monthlyRoom = Math.max(
       0,
       profile.takeHomeIncome -
         profile.essentialExpenses -
         profile.monthlyBuffer -
-        profile.monthlyDebtPayment,
+        monthlyDebtPayment,
     );
     const ratio =
-      profile.grossIncome > 0
-        ? (profile.monthlyDebtPayment / profile.grossIncome) * 100
+      profile.grossMonthlyIncome > 0
+        ? (monthlyDebtPayment / profile.grossMonthlyIncome) * 100
         : null;
     const questionText = question.toLowerCase();
     const focus = questionText.includes("car")
-      ? "For a car, compare the full ownership cost—including insurance, fuel, maintenance, and fees—not only the installment."
+      ? "For a car, compare the full ownership cost—including insurance, fuel, maintenance, and fees—not only the instalment."
       : questionText.includes("home") ||
           questionText.includes("house") ||
           questionText.includes("mortgage")
         ? "For a home, account for rates, levies, insurance, utilities, transfer costs, and possible rate changes in addition to the bond payment."
         : "A useful next step is to compare any new payment with your monthly room while keeping your safety buffer intact.";
     response.json({
-      answer: `Your current listed debt is ${profile.totalDebt.toFixed(2)} with monthly debt payments of ${profile.monthlyDebtPayment.toFixed(2)}. ${
+      answer: `Your current listed debt is ${totalDebt.toFixed(2)} with monthly debt payments of ${monthlyDebtPayment.toFixed(2)}. ${
         ratio === null
           ? "Add gross income to estimate your debt-to-income ratio."
           : `Your listed debt-to-income ratio is ${ratio.toFixed(1)}%.`
@@ -827,19 +823,25 @@ export function createApp({ pool }) {
 
   app.use((error, request, response, next) => {
     if (response.headersSent) return next(error);
-    if (error instanceof ApiError) {
+    if (error instanceof ApiError || error?.status === 409) {
       return response
         .status(error.status)
-        .json({ error: error.message, ...(error.details ? { details: error.details } : {}) });
+        .json({
+          error: error.message,
+          ...(error.details ? { details: error.details } : {}),
+        });
+    }
+    if (error?.code === "P2002") {
+      return response.status(409).json({ error: "A conflicting record already exists." });
+    }
+    if (error?.code === "P2003" || error?.code === "P2025") {
+      return response.status(404).json({ error: "Requested record not found." });
+    }
+    if (error?.code === "P2004") {
+      return response.status(400).json({ error: "Invalid request." });
     }
     if (error?.type === "entity.parse.failed") {
       return response.status(400).json({ error: "Invalid JSON request body." });
-    }
-    if (error?.code === "23503") {
-      return response.status(404).json({ error: "Requested record not found." });
-    }
-    if (error?.code === "23514" || error?.code === "22P02") {
-      return response.status(400).json({ error: "Invalid request." });
     }
     process.stderr.write("An API request failed.\n");
     return response.status(500).json({ error: "Something went wrong." });

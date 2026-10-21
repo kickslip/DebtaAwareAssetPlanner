@@ -9,6 +9,8 @@ import android.content.Intent
 import android.widget.RemoteViews
 import za.co.debtaware.R
 import za.co.debtaware.app.MainActivity
+import za.co.debtaware.app.SecureTokenStore
+import za.co.debtaware.app.WidgetSummary
 import java.text.NumberFormat
 import java.util.Currency
 import java.util.Locale
@@ -19,22 +21,22 @@ class DebtAwareWidgetProvider : AppWidgetProvider() {
         manager: AppWidgetManager,
         appWidgetIds: IntArray,
     ) {
-        val preferences =
-            context.getSharedPreferences(WIDGET_PREFS, Context.MODE_PRIVATE)
-        val totalDebt = preferences.getFloat(TOTAL_DEBT_KEY, 0f).toDouble()
-        val monthlyRoom = preferences.getFloat(MONTHLY_ROOM_KEY, 0f).toDouble()
-        val signedIn = preferences.getBoolean(SIGNED_IN_KEY, false)
+        val summary = SecureTokenStore(context).readWidgetSummary()
 
         appWidgetIds.forEach { widgetId ->
             val views = RemoteViews(context.packageName, R.layout.widget_overview)
             views.setTextViewText(
                 R.id.widget_total_debt,
-                if (signedIn) currency(totalDebt) else context.getString(R.string.widget_debt_default),
+                when {
+                    summary == null -> context.getString(R.string.widget_debt_default)
+                    summary.showAmounts -> currency(summary.totalDebt)
+                    else -> context.getString(R.string.widget_balances_hidden)
+                },
             )
             views.setTextViewText(
                 R.id.widget_monthly_room,
-                if (signedIn) {
-                    "Modeled monthly room · ${currency(monthlyRoom)}"
+                if (summary?.showAmounts == true) {
+                    "Modeled monthly room · ${currency(summary.monthlyRoom)}"
                 } else {
                     context.getString(R.string.widget_room_default)
                 },
@@ -55,18 +57,21 @@ class DebtAwareWidgetProvider : AppWidgetProvider() {
     }
 
     companion object {
-        const val WIDGET_PREFS = "debtaware_widget_overview"
-        const val TOTAL_DEBT_KEY = "total_debt"
-        const val MONTHLY_ROOM_KEY = "monthly_room"
-        const val SIGNED_IN_KEY = "signed_in"
-
-        fun refresh(context: Context, totalDebt: Double, monthlyRoom: Double) {
-            context.getSharedPreferences(WIDGET_PREFS, Context.MODE_PRIVATE)
-                .edit()
-                .putFloat(TOTAL_DEBT_KEY, totalDebt.toFloat())
-                .putFloat(MONTHLY_ROOM_KEY, monthlyRoom.toFloat())
-                .putBoolean(SIGNED_IN_KEY, true)
-                .apply()
+        fun refresh(
+            context: Context,
+            totalDebt: Double,
+            monthlyRoom: Double,
+            showAmounts: Boolean? = null,
+        ) {
+            val store = SecureTokenStore(context)
+            val current = store.readWidgetSummary()
+            store.saveWidgetSummary(
+                WidgetSummary(
+                    totalDebt = totalDebt,
+                    monthlyRoom = monthlyRoom,
+                    showAmounts = showAmounts ?: current?.showAmounts ?: false,
+                ),
+            )
             val manager = AppWidgetManager.getInstance(context)
             val component = ComponentName(context, DebtAwareWidgetProvider::class.java)
             val ids = manager.getAppWidgetIds(component)
@@ -76,10 +81,7 @@ class DebtAwareWidgetProvider : AppWidgetProvider() {
         }
 
         fun clear(context: Context) {
-            context.getSharedPreferences(WIDGET_PREFS, Context.MODE_PRIVATE)
-                .edit()
-                .clear()
-                .apply()
+            SecureTokenStore(context).clearWidgetSummary()
             val manager = AppWidgetManager.getInstance(context)
             val component = ComponentName(context, DebtAwareWidgetProvider::class.java)
             val ids = manager.getAppWidgetIds(component)

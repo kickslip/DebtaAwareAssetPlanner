@@ -14,3 +14,4 @@ android/*.apk
 android/*.aab
 android/*.jks
 android/*.keystore
+/generated/prisma/

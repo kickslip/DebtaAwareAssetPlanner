@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -28,6 +29,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -52,6 +54,7 @@ import za.co.debtaware.widget.DebtAwareWidgetProvider
 import java.text.NumberFormat
 import java.util.Currency
 import java.util.Locale
+import java.util.UUID
 
 class MainActivity : ComponentActivity() {
     private lateinit var tokenStore: SecureTokenStore
@@ -79,6 +82,7 @@ private fun DebtAwareScreen(tokenStore: SecureTokenStore, startWithPayment: Bool
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var token by remember { mutableStateOf(tokenStore.read()) }
+    var userId by remember { mutableStateOf(tokenStore.readUserId()) }
     var overview by remember { mutableStateOf<DebtOverview?>(null) }
     var email by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
@@ -90,6 +94,15 @@ private fun DebtAwareScreen(tokenStore: SecureTokenStore, startWithPayment: Bool
     var error by remember { mutableStateOf("") }
     var notificationEnabled by remember {
         mutableStateOf(PaymentNotification.isOptedIn(context))
+    }
+    var pendingPayment by remember {
+        mutableStateOf(
+            tokenStore.readUserId()?.let(tokenStore::readPendingPayment),
+        )
+    }
+    var hasLocalData by remember { mutableStateOf(tokenStore.hasLocalData()) }
+    var showWidgetBalances by remember {
+        mutableStateOf(tokenStore.readWidgetSummary()?.showAmounts ?: false)
     }
     val notificationPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
@@ -111,7 +124,7 @@ private fun DebtAwareScreen(tokenStore: SecureTokenStore, startWithPayment: Bool
         }
     }
 
-    LaunchedEffect(token) {
+    LaunchedEffect(token, userId) {
         if (token == null) {
             overview = null
             DebtAwareWidgetProvider.clear(context)
@@ -119,6 +132,12 @@ private fun DebtAwareScreen(tokenStore: SecureTokenStore, startWithPayment: Bool
             return@LaunchedEffect
         }
         try {
+            pendingPayment = userId?.let(tokenStore::readPendingPayment)
+            pendingPayment?.let {
+                paymentAmount = it.amount.toString()
+                paymentNote = it.note
+                selectedDebtId = it.debtAccountId
+            }
             notificationEnabled = ApiClient.paymentRemindersEnabled(token!!)
             PaymentNotification.setOptedIn(context, notificationEnabled)
             OverviewSyncWorker.schedule(context)
@@ -136,6 +155,8 @@ private fun DebtAwareScreen(tokenStore: SecureTokenStore, startWithPayment: Bool
             if (requestError.message?.contains("Sign in") == true) {
                 tokenStore.clear()
                 token = null
+                userId = null
+                hasLocalData = tokenStore.hasLocalData()
             }
         }
     }
@@ -182,14 +203,29 @@ private fun DebtAwareScreen(tokenStore: SecureTokenStore, startWithPayment: Bool
                     onPasswordChange = { password = it },
                     busy = busy,
                     error = error,
+                    hasLocalData = hasLocalData,
+                    onClearLocalData = {
+                        tokenStore.clearAll()
+                        PaymentNotification.clearPreference(context)
+                        OverviewSyncWorker.cancel(context)
+                        DebtAwareWidgetProvider.clear(context)
+                        pendingPayment = null
+                        userId = null
+                        showWidgetBalances = false
+                        hasLocalData = false
+                    },
                     onSignIn = {
                         scope.launch {
                             busy = true
                             error = ""
                             try {
                                 val newToken = ApiClient.signIn(email, password)
-                                tokenStore.save(newToken)
-                                token = newToken
+                                tokenStore.save(newToken.token, newToken.userId)
+                                userId = newToken.userId
+                                token = newToken.token
+                                showWidgetBalances =
+                                    tokenStore.readWidgetSummary()?.showAmounts ?: false
+                                hasLocalData = true
                                 password = ""
                             } catch (requestError: Exception) {
                                 error = requestError.message ?: "Sign-in failed."
@@ -221,23 +257,37 @@ private fun DebtAwareScreen(tokenStore: SecureTokenStore, startWithPayment: Bool
                         onAmountChange = { paymentAmount = it },
                         note = paymentNote,
                         onNoteChange = { paymentNote = it },
+                        paymentPending = pendingPayment != null,
                         busy = busy,
                         startWithPayment = startWithPayment,
                         onSave = {
                             val amount = paymentAmount.toDoubleOrNull()
-                            if (amount == null || amount <= 0) {
-                                error = "Enter a payment amount greater than zero."
+                            if (amount == null || !isValidPaymentAmount(amount)) {
+                                error = "Enter a payment amount from R0.01 to R1,000,000,000 with no more than two decimal places."
                             } else {
                                 scope.launch {
                                     busy = true
                                     error = ""
                                     try {
+                                        val pending = pendingPayment ?: PendingPayment(
+                                            idempotencyKey = UUID.randomUUID().toString(),
+                                            userId = userId!!,
+                                            debtAccountId = selectedDebtId,
+                                            amount = amount,
+                                            note = paymentNote.take(250),
+                                        ).also {
+                                            tokenStore.savePendingPayment(it)
+                                            pendingPayment = it
+                                        }
                                         ApiClient.addPayment(
                                             token!!,
-                                            selectedDebtId,
-                                            amount,
-                                            paymentNote,
+                                            pending.debtAccountId,
+                                            pending.amount,
+                                            pending.note,
+                                            pending.idempotencyKey,
                                         )
+                                        tokenStore.clearPendingPayment(pending.idempotencyKey)
+                                        pendingPayment = null
                                         paymentAmount = ""
                                         paymentNote = ""
                                         overview = ApiClient.loadOverview(token!!)
@@ -308,6 +358,18 @@ private fun DebtAwareScreen(tokenStore: SecureTokenStore, startWithPayment: Bool
                             }
                         },
                     )
+                    WidgetPrivacyCard(
+                        showAmounts = showWidgetBalances,
+                        onToggle = {
+                            showWidgetBalances = it
+                            DebtAwareWidgetProvider.refresh(
+                                context,
+                                currentOverview.totalDebt,
+                                currentOverview.monthlyRoom,
+                                showAmounts = it,
+                            )
+                        },
+                    )
                 }
                 if (error.isNotBlank()) {
                     Text(error, color = Color(0xFFAA5D4D), fontSize = 12.sp)
@@ -318,11 +380,16 @@ private fun DebtAwareScreen(tokenStore: SecureTokenStore, startWithPayment: Bool
                             busy = true
                             try {
                                 ApiClient.signOut(token!!)
-                            } catch (_: Exception) {
-                            } finally {
                                 tokenStore.clear()
                                 token = null
+                                userId = null
+                                showWidgetBalances = false
                                 PaymentNotification.setOptedIn(context, false)
+                                hasLocalData = tokenStore.hasLocalData()
+                            } catch (_: Exception) {
+                                error =
+                                    "Could not revoke the server session. Check your connection and try signing out again."
+                            } finally {
                                 busy = false
                             }
                         }
@@ -350,8 +417,11 @@ private fun SignInCard(
     onPasswordChange: (String) -> Unit,
     busy: Boolean,
     error: String,
+    hasLocalData: Boolean,
+    onClearLocalData: () -> Unit,
     onSignIn: () -> Unit,
 ) {
+    var confirmClear by remember { mutableStateOf(false) }
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = Color.White),
@@ -392,7 +462,36 @@ private fun SignInCard(
             ) {
                 Text(if (busy) "Signing in…" else "Sign in")
             }
+            if (hasLocalData) {
+                TextButton(onClick = { confirmClear = true }) {
+                    Text("Clear encrypted data on this device")
+                }
+            }
         }
+    }
+    if (confirmClear) {
+        AlertDialog(
+            onDismissRequest = { confirmClear = false },
+            title = { Text("Clear this device?") },
+            text = {
+                Text(
+                    "This removes the encrypted session, pending payment retries, and widget cache from this device. Verify any payment with an uncertain result in your account history first.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    onClearLocalData()
+                    confirmClear = false
+                }) {
+                    Text("Clear device data")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmClear = false }) {
+                    Text("Cancel")
+                }
+            },
+        )
     }
 }
 
@@ -459,6 +558,7 @@ private fun PaymentCard(
     onAmountChange: (String) -> Unit,
     note: String,
     onNoteChange: (String) -> Unit,
+    paymentPending: Boolean,
     busy: Boolean,
     startWithPayment: Boolean,
     onSave: () -> Unit,
@@ -477,13 +577,18 @@ private fun PaymentCard(
                 fontSize = 15.sp,
             )
             Text(
-                "Manual entry only. This does not move money from your bank.",
+                if (paymentPending) {
+                    "Retrying the saved payment uses the same request key, so it cannot be recorded twice."
+                } else {
+                    "Manual entry only. This does not move money from your bank."
+                },
                 color = Color(0xFF89948C),
                 fontSize = 10.sp,
             )
             Column {
                 OutlinedButton(
                     onClick = { onMenuExpandedChange(true) },
+                    enabled = !paymentPending,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Text(
@@ -513,12 +618,13 @@ private fun PaymentCard(
                     }
                 }
             }
-            OutlinedTextField(
+                OutlinedTextField(
                 value = amount,
                 onValueChange = onAmountChange,
                 label = { Text("Amount paid (R)") },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
+                enabled = !paymentPending,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
             )
             OutlinedTextField(
@@ -527,13 +633,20 @@ private fun PaymentCard(
                 label = { Text("Note (optional)") },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
+                enabled = !paymentPending,
             )
             Button(
                 onClick = onSave,
                 enabled = !busy && amount.toDoubleOrNull()?.let { it > 0 } == true,
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text(if (busy) "Saving…" else "Save payment")
+                Text(
+                    when {
+                        busy -> "Saving…"
+                        paymentPending -> "Retry saved payment"
+                        else -> "Save payment"
+                    },
+                )
             }
         }
     }
@@ -567,6 +680,39 @@ private fun NotificationCard(enabled: Boolean, onToggle: () -> Unit) {
     }
 }
 
+@Composable
+private fun WidgetPrivacyCard(
+    showAmounts: Boolean,
+    onToggle: (Boolean) -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    "Show balances on home-screen widget",
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 12.sp,
+                )
+                Text(
+                    "Off by default. Anyone who can see your home screen may see these amounts.",
+                    color = Color(0xFF89948C),
+                    fontSize = 10.sp,
+                )
+            }
+            Switch(checked = showAmounts, onCheckedChange = onToggle)
+        }
+    }
+}
+
 private fun formatCurrency(value: Double): String =
     NumberFormat.getCurrencyInstance(Locale("en", "ZA")).apply {
         currency = Currency.getInstance("ZAR")
@@ -574,3 +720,7 @@ private fun formatCurrency(value: Double): String =
     }.format(value)
 
 private fun Double.fmt(): String = String.format(Locale.US, "%.1f", this)
+
+private fun isValidPaymentAmount(amount: Double): Boolean =
+    amount in 0.01..1_000_000_000.0 &&
+        kotlin.math.abs(amount * 100 - kotlin.math.round(amount * 100)) < 1e-6

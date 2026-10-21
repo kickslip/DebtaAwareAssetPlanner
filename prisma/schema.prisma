@@ -1,0 +1,159 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum DebtType {
+  credit_card
+  personal_loan
+  vehicle
+  home
+  other
+
+  @@map("debt_type")
+}
+
+enum GoalType {
+  home
+  car
+  other
+
+  @@map("goal_type")
+}
+
+enum ConsentType {
+  privacy_notice
+  open_banking
+  ai_processing
+  marketing
+
+  @@map("consent_type")
+}
+
+model User {
+  id                      String                  @id @default(uuid()) @db.Uuid
+  email                   String                  @unique @db.VarChar(254)
+  passwordHash            String                  @map("password_hash") @db.Text
+  privacyConsentAt        DateTime                @default(now()) @map("privacy_consent_at") @db.Timestamptz(6)
+  createdAt               DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
+  sessions                Session[]
+  financialProfile        FinancialProfile?
+  debtAccounts            DebtAccount[]
+  payments                Payment[]
+  goals                   Goal[]
+  notificationPreferences NotificationPreference?
+  consentRecords          ConsentRecord[]
+
+  @@map("users")
+}
+
+model Session {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  tokenHash String   @unique @map("token_hash") @db.Char(64)
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+model FinancialProfile {
+  userId             String   @id @map("user_id") @db.Uuid
+  grossMonthlyIncome Decimal  @default(0) @map("gross_monthly_income") @db.Decimal(14, 2)
+  takeHomeIncome     Decimal  @default(0) @map("take_home_income") @db.Decimal(14, 2)
+  essentialExpenses  Decimal  @default(0) @map("essential_expenses") @db.Decimal(14, 2)
+  monthlyBuffer      Decimal  @default(0) @map("monthly_buffer") @db.Decimal(14, 2)
+  updatedAt          DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  user               User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("financial_profiles")
+}
+
+model DebtAccount {
+  id             String    @id @default(uuid()) @db.Uuid
+  userId         String    @map("user_id") @db.Uuid
+  name           String    @db.VarChar(80)
+  debtType       DebtType  @map("debt_type")
+  balance        Decimal   @db.Decimal(14, 2)
+  monthlyPayment Decimal   @map("monthly_payment") @db.Decimal(14, 2)
+  annualRate     Decimal   @default(0) @map("annual_rate") @db.Decimal(7, 4)
+  idempotencyKey String    @map("idempotency_key") @db.VarChar(128)
+  requestHash    String    @map("request_hash") @db.Char(64)
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  payments       Payment[]
+
+  @@unique([id, userId])
+  @@unique([userId, idempotencyKey])
+  @@index([userId])
+  @@map("debt_accounts")
+}
+
+model Payment {
+  id             String       @id @default(uuid()) @db.Uuid
+  userId         String       @map("user_id") @db.Uuid
+  debtAccountId  String?      @map("debt_account_id") @db.Uuid
+  amount         Decimal      @db.Decimal(14, 2)
+  note           String       @default("") @db.VarChar(250)
+  paidAt         DateTime     @map("paid_at") @db.Timestamptz(6)
+  idempotencyKey String       @map("idempotency_key") @db.VarChar(128)
+  requestHash    String       @map("request_hash") @db.Char(64)
+  createdAt      DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  debtAccount    DebtAccount? @relation(fields: [debtAccountId, userId], references: [id, userId], onDelete: Cascade)
+
+  @@unique([userId, idempotencyKey])
+  @@index([userId, paidAt(sort: Desc)])
+  @@index([debtAccountId])
+  @@map("payments")
+}
+
+model Goal {
+  id             String    @id @default(uuid()) @db.Uuid
+  userId         String    @map("user_id") @db.Uuid
+  goalType       GoalType  @map("goal_type")
+  name           String    @db.VarChar(100)
+  targetAmount   Decimal   @map("target_amount") @db.Decimal(14, 2)
+  depositAmount  Decimal   @default(0) @map("deposit_amount") @db.Decimal(14, 2)
+  targetDate     DateTime? @map("target_date") @db.Date
+  idempotencyKey String    @map("idempotency_key") @db.VarChar(128)
+  requestHash    String    @map("request_hash") @db.Char(64)
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, idempotencyKey])
+  @@index([userId])
+  @@map("goals")
+}
+
+model NotificationPreference {
+  userId                  String   @id @map("user_id") @db.Uuid
+  paymentRemindersEnabled Boolean  @default(false) @map("payment_reminders_enabled")
+  goalUpdatesEnabled      Boolean  @default(false) @map("goal_updates_enabled")
+  updatedAt               DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  user                    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("notification_preferences")
+}
+
+model ConsentRecord {
+  id            String      @id @default(uuid()) @db.Uuid
+  userId        String      @map("user_id") @db.Uuid
+  consentType   ConsentType @map("consent_type")
+  policyVersion String      @map("policy_version") @db.VarChar(40)
+  grantedAt     DateTime    @default(now()) @map("granted_at") @db.Timestamptz(6)
+  withdrawnAt   DateTime?   @map("withdrawn_at") @db.Timestamptz(6)
+  user          User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, consentType])
+  @@map("consent_records")
+}

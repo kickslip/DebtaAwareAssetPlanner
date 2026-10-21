@@ -24,6 +24,13 @@ object PaymentNotification {
         if (enabled) createChannel(context)
     }
 
+    fun clearPreference(context: Context) {
+        context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+            .edit()
+            .clear()
+            .apply()
+    }
+
     fun isOptedIn(context: Context): Boolean =
         context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
             .getBoolean(OPTED_IN, false)
