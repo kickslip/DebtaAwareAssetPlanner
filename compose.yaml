@@ -1,0 +1,20 @@
+services:
+  database:
+    image: postgres:17.6-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: debtaware
+      POSTGRES_USER: debtaware
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in your local .env file}
+    ports:
+      - "5432:5432"
+    volumes:
+      - debtaware-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U debtaware -d debtaware"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  debtaware-postgres:

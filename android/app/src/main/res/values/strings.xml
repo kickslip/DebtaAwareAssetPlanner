@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">DebtAware</string>
+    <string name="widget_description">View a cached debt overview and quickly record a payment.</string>
+    <string name="widget_debt_default">Sign in to see debt</string>
+    <string name="widget_room_default">Open DebtAware to refresh your overview</string>
+    <string name="widget_add_payment">Add payment</string>
+    <string name="notification_channel_name">Payment confirmations</string>
+    <string name="notification_channel_description">Confirmations after you record a payment.</string>
+</resources>
